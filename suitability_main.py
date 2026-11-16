@@ -2,12 +2,8 @@
 import os
 import io
 import re
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.image import MIMEImage
-from email.mime.text   import MIMEText
-from email.mime.application import MIMEApplication
-from email.utils import formataddr
+import base64
+import requests
 from datetime import datetime
 import streamlit as st
 
@@ -61,31 +57,38 @@ st.markdown("## Questionário – Bluemetrix Asset")
 st.write("Preencha os campos abaixo para realizar o cadastro da API")
 
 
-# --------------------------- E-MAIL (envio automático) ---------------------------
-# Configuração de e-mail (envio sempre do mesmo endereço)
-EMAIL_USER = st.secrets["EMAIL_USER"]
-EMAIL_PASSWORD = st.secrets["EMAIL_PASSWORD"]
-EMAIL_FROM_NAME = "Middle Office Bluemetrix"
-EMAIL_TO = "backoffice@bluemetrix.com.br"
-
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-
+# --------------------------- E-MAIL (envio automático via Microsoft Graph) ---------------------------
+# Envio pela caixa compartilhada do Microsoft 365, usando o app "Suitability Streamlit" (Entra ID).
+# Credenciais ficam nos secrets do Streamlit, nunca no código.
+MS_TENANT_ID     = st.secrets["MS_TENANT_ID"]
+MS_CLIENT_ID     = st.secrets["MS_CLIENT_ID"]
+MS_CLIENT_SECRET = st.secrets["MS_CLIENT_SECRET"]
+EMAIL_SENDER     = st.secrets.get("EMAIL_SENDER", "middleoffice@bluemetrix.com.br")
+EMAIL_TO         = "backoffice@bluemetrix.com.br"
 
 
-def enviar_email(nome_cliente: str, pdf_bytes: bytes) -> bool:
+def _obter_token_graph() -> str:
+    """Obtém um token de aplicação (client credentials) para o Microsoft Graph."""
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token",
+        data={
+            "client_id": MS_CLIENT_ID,
+            "client_secret": MS_CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Falha ao autenticar no Microsoft 365 ({resp.status_code}): {resp.text}")
+    return resp.json()["access_token"]
+
+
+def enviar_email(nome_cliente: str, pdf_bytes: bytes, perfil: str) -> bool:
+    """Envia o PDF para o Backoffice. Retorna True só se o Microsoft 365 aceitar a mensagem."""
     data_br = datetime.now().strftime("%d/%m/%Y")
     data_nome = datetime.now().strftime("%d-%m-%Y")
     nome_pdf = f"API_{perfil}_{nome_cliente}_{data_nome}.pdf".replace(" ", "_")
-
-    msg = MIMEMultipart("related")  # permite HTML + imagens
-    msg["Subject"] = f"API – {nome_cliente} – {data_br}"
-    msg["From"] = formataddr((EMAIL_FROM_NAME, EMAIL_USER))
-    msg["To"] = EMAIL_TO
-
-    # Bloco alternativo (texto + html)
-    msg_alternativo = MIMEMultipart("alternative")
-    msg.attach(msg_alternativo)
 
     corpo_html = f"""
     <p>Olá,</p>
@@ -94,26 +97,44 @@ def enviar_email(nome_cliente: str, pdf_bytes: bytes) -> bool:
     <img src="cid:assinatura_bluemetrix" style="width:500px; height:auto;">
     """
 
-    msg_alternativo.attach(MIMEText(corpo_html, "html", "utf-8"))
-
-    # Adiciona assinatura como imagem inline
     with open("Assinatura Middle.png", "rb") as f:
-        img = MIMEImage(f.read())
-        img.add_header("Content-ID", "<assinatura_bluemetrix>")
-        img.add_header("Content-Disposition", "inline", filename="assinatura.png")
-        msg.attach(img)
+        assinatura_b64 = base64.b64encode(f.read()).decode()
 
-    # Anexo PDF
-    anexo = MIMEApplication(pdf_bytes, _subtype="pdf")
-    anexo.add_header("Content-Disposition", "attachment", filename=nome_pdf)
-    msg.attach(anexo)
-
+    mensagem = {
+        "message": {
+            "subject": f"API – {nome_cliente} – {data_br}",
+            "body": {"contentType": "HTML", "content": corpo_html},
+            "toRecipients": [{"emailAddress": {"address": EMAIL_TO}}],
+            "attachments": [
+                {   # assinatura inline (referenciada por cid no HTML)
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": "assinatura.png",
+                    "contentType": "image/png",
+                    "contentBytes": assinatura_b64,
+                    "contentId": "assinatura_bluemetrix",
+                    "isInline": True,
+                },
+                {   # PDF do questionário
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": nome_pdf,
+                    "contentType": "application/pdf",
+                    "contentBytes": base64.b64encode(pdf_bytes).decode(),
+                },
+            ],
+        },
+        "saveToSentItems": True,
+    }
 
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_USER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_USER, [EMAIL_TO], msg.as_string())
+        token = _obter_token_graph()
+        resp = requests.post(
+            f"https://graph.microsoft.com/v1.0/users/{EMAIL_SENDER}/sendMail",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=mensagem,
+            timeout=60,
+        )
+        if resp.status_code != 202:  # o Graph responde 202 quando aceita o envio
+            raise RuntimeError(f"Microsoft 365 recusou o envio ({resp.status_code}): {resp.text}")
         return True
     except Exception as e:
         st.error(f"Falha no envio por e-mail: {e}")
@@ -241,8 +262,5 @@ if st.button("Gerar e Enviar"):
     #mime="application/pdf",
 #)
     # envio automático
-    try:
-        enviar_email(nome_cliente, pdf_bytes)
+    if enviar_email(nome_cliente, pdf_bytes, perfil):
         st.success("E-mail enviado com sucesso para o Backoffice.")
-    except Exception as e:
-        st.error(f"Falha no envio por e-mail: {e}")
